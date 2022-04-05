@@ -5,6 +5,7 @@
 # Created time: 2022/03/26
 from datetime import datetime
 from typing import List
+from numpy import double
 
 import pytz
 import requests
@@ -97,7 +98,7 @@ class TdEngineDatabase(BaseDatabase):
         self.execute_sql(
             f"create database if not exists {self.database} keep 36500 update 2"
         )
-        bar_sql = f"create stable if not exists {self.bar_super_table} (time TIMESTAMP, {','.join([f'{field} DOUBLE' for field in self.bar_fields[1:]])}) tags (intervals BINARY(10), vt_symbol BINARY(20), total int)"
+        bar_sql = f"create stable if not exists {self.bar_super_table} (time TIMESTAMP, {','.join([f'{field} DOUBLE' for field in self.bar_fields[1:]])}) tags (intervals BINARY(10), vt_symbol BINARY(20), total int, start_time DOUBLE, end_time DOUBLE)"
         self.execute_sql(bar_sql)
         tick_sql = f"create stable if not exists {self.tick_super_table} (time TIMESTAMP, {','.join([f'{field} DOUBLE' for field in self.tick_fields[1:-1]])}, localtime TIMESTAMP) tags (vt_symbol BINARY(20))"
         self.execute_sql(tick_sql)
@@ -110,15 +111,27 @@ class TdEngineDatabase(BaseDatabase):
         interval: Interval = bar.interval
 
         values: List[str] = []
-        for bar in bars:
-            v = f"""({int(bar.datetime.timestamp()*1000)},{bar.open_price},{bar.high_price},{bar.low_price},{bar.close_price},{bar.volume},{bar.turnover},{bar.open_interest})"""
-            values.append(v)
+        start = end = bar.datetime.timestamp() * 1000
+        total = 0
         results = self.execute_sql(
             f"select total from {self.bar_super_table} where vt_symbol='{vt_symbol}' and intervals='{interval.value}'"
         )
-        total = results[0][0] if results else 0
-        sql = f"""insert into {bar.exchange.value}_{bar.symbol}_{interval.value} using {self.bar_super_table} tags ({interval.value}, {vt_symbol}, {len(bars)+total}) values {' '.join(values)}"""
-        self.execute_sql(sql)
+        if results:
+            total = results[0][0]
+            start = double(results[0][1])
+            end = double(results[0][2])
+        for bar in bars:
+            ts = bar.datetime.timestamp() * 1000
+            v = f"""({int(ts)},{bar.open_price},{bar.high_price},{bar.low_price},{bar.close_price},{bar.volume},{bar.turnover},{bar.open_interest})"""
+            values.append(v)
+            end = ts if ts > end else end
+            start = ts if ts < start else start
+        table_name = f"{bar.exchange.value}_{bar.symbol}_{interval.value}"
+        sql = f"""insert into {table_name} using {self.bar_super_table} tags ({interval.value}, {vt_symbol}, {len(bars)+total}, {start}, {end}) values {' '.join(values)}"""
+        self.execute_sql(sql)  # 插入数据
+        self.execute_sql(
+            f"alter table {table_name} set tag total={len(bars)+total};alter table {table_name} set tag start_time={start};alter table {table_name} set tag end_time={end}"
+        )  # 修改tag
         return True
 
     def save_tick_data(self, ticks: List[TickData]) -> bool:
@@ -200,26 +213,23 @@ class TdEngineDatabase(BaseDatabase):
         return self.execute_sql(sql)
 
     def get_bar_overview(self) -> List[BarOverview]:
-        sql = f"""select tbname, intervals, vt_symbol, total from {self.bar_super_table}"""
+        sql = f"""select tbname, intervals, vt_symbol, total, start_time, end_time from {self.bar_super_table}"""
         data = self.execute_sql(sql)
         results: List[BarOverview] = []
         for item in data:
             symbol, exchange = extract_vt_symbol(item[2].upper())
-            min_ts = self.execute_sql(
-                f"select time from {exchange.value}_{symbol}_{item[1]} order by time limit 1"
-            )
-            max_ts = self.execute_sql(
-                f"select time from {exchange.value}_{symbol}_{item[1]} order by time desc limit 1"
-            )
-            if max_ts and min_ts:
-                results.append(
-                    BarOverview(
-                        symbol=symbol.lower(),
-                        exchange=exchange,
-                        interval=Interval(item[1]),
-                        count=int(item[3]),
-                        start=datetime.strptime(min_ts[0][0], "%Y-%m-%d %H:%M:%S.%f"),
-                        end=datetime.strptime(max_ts[0][0], "%Y-%m-%d %H:%M:%S.%f"),
-                    )
+            results.append(
+                BarOverview(
+                    symbol=symbol.lower(),
+                    exchange=exchange,
+                    interval=Interval(item[1]),
+                    count=int(item[3]),
+                    start=datetime.utcfromtimestamp(float(item[4]) / 1000).replace(
+                        tzinfo=pytz.utc
+                    ),
+                    end=datetime.utcfromtimestamp(float(item[5]) / 1000).replace(
+                        tzinfo=pytz.utc
+                    ),
                 )
+            )
         return results
